@@ -6,12 +6,12 @@ app = Flask(__name__)
 
 UPLOAD_FOLDER = 'uploads'
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB limit
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # Лимит 16 МБ
 
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
-# In-memory room database
+# База данных комнат в оперативной памяти
 rooms_data = {}
 
 def get_allowed_name(room, requested_name, session_id):
@@ -39,12 +39,12 @@ def create_room():
     data = request.json or {}
     port = int(data.get('port', 0))
     if port < 1 or port > 9999:
-        return jsonify({"error": "Port must be between 1 and 9999"}), 400
+        return jsonify({"error": "Порт должен быть от 1 до 9999"}), 400
     if port in rooms_data:
         return jsonify({"success": True})
     rooms_data[port] = {
         "users": {},
-        "messages": [{"sender": "System", "type": "text", "text": f"Room on port {port} created!"}]
+        "messages": [{"sender": "Система", "type": "text", "text": f"Комната порта {port} создана!"}]
     }
     return jsonify({"success": True})
 
@@ -56,20 +56,20 @@ def join_room():
     requested_name = data.get('username', '').strip()
     
     if port not in rooms_data:
-        return jsonify({"error": f"Room {port} hasn't been created yet!"}), 404
+        return jsonify({"error": f"Комната {port} еще не создана!"}), 404
         
     room = rooms_data[port]
     if session_id not in room["users"] and len(room["users"]) >= 2:
-        return jsonify({"error": f"Room {port} already has 2 participants!"}), 403
+        return jsonify({"error": f"В комнате {port} уже есть 2 участника!"}), 403
         
     final_name = get_allowed_name(room, requested_name, session_id)
     if session_id not in room["users"]:
         room["users"][session_id] = final_name
-        room["messages"].append({"sender": "System", "type": "text", "text": f"{final_name} joined the room."})
+        room["messages"].append({"sender": "Система", "type": "text", "text": f"{final_name} вошел в комнату."})
     elif room["users"][session_id] != final_name:
         old_name = room["users"][session_id]
         room["users"][session_id] = final_name
-        room["messages"].append({"sender": "System", "type": "text", "text": f"{old_name} changed to {final_name}."})
+        room["messages"].append({"sender": "Система", "type": "text", "text": f"{old_name} изменен на {final_name}."})
         
     return jsonify({"user": final_name, "messages": room["messages"], "active_users": list(room["users"].values())})
 
@@ -81,17 +81,17 @@ def change_nickname():
     new_name = data.get('username', '').strip()
     
     if port not in rooms_data or session_id not in rooms_data[port]["users"]:
-        return jsonify({"error": "Room not found"}), 400
+        return jsonify({"error": "Комната не найдена"}), 400
     room = rooms_data[port]
     existing_names = [name.lower() for sid, name in room["users"].items() if sid != session_id]
     if new_name.lower() in existing_names:
-        return jsonify({"error": "This nickname is already taken!"}), 400
+        return jsonify({"error": "Этот никнейм уже занят!"}), 400
     if not new_name:
-        return jsonify({"error": "Nickname is empty"}), 400
+        return jsonify({"error": "Никнейм пустой"}), 400
 
     old_name = room["users"][session_id]
     room["users"][session_id] = new_name
-    room["messages"].append({"sender": "System", "type": "text", "text": f"{old_name} changed their name to {new_name}"})
+    room["messages"].append({"sender": "Система", "type": "text", "text": f"{old_name} сменил имя на {new_name}"})
     return jsonify({"success": True, "username": new_name})
 
 @app.route('/get_messages/<int:port>', methods=['GET'])
@@ -117,12 +117,12 @@ def upload_file():
     port = int(request.form.get('port', 0))
     session_id = request.form.get('session_id')
     if port not in rooms_data or session_id not in rooms_data[port]["users"]:
-        return jsonify({"error": "Session error"}), 400
+        return jsonify({"error": "Ошибка сессии"}), 400
     if 'file' not in request.files:
-        return jsonify({"error": "File not found"}), 400
+        return jsonify({"error": "Файл не найден"}), 400
     file = request.files['file']
     if file.filename == '':
-        return jsonify({"error": "No file selected"}), 400
+        return jsonify({"error": "Файл не выбран"}), 400
     if file:
         filename = secure_filename(file.filename)
         unique_filename = f"{port}_{session_id[:4]}_{filename}"
@@ -141,7 +141,7 @@ def upload_file():
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     preview_content = f.read(1000)
             except Exception:
-                preview_content = "Preview read error."
+                preview_content = "Ошибка чтения предпросмотра."
         rooms_data[port]['messages'].append({
             "sender": user, "type": file_type, "filename": filename, "url": f"/uploads/{unique_filename}", "text": preview_content
         })
@@ -149,10 +149,10 @@ def upload_file():
 
 HTML_CODE = """
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>YuuY - 2-User Chat</title>
+    <title>2-User Chat Hub</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', sans-serif; }
         body { display: flex; height: 100vh; background: #0f172a; color: #e2e8f0; overflow: hidden; }
@@ -196,53 +196,53 @@ HTML_CODE = """
 </head>
 <body>
     <div class="sidebar">
-        <div class="sidebar-header">YuuY - 2-User Chat</div>
+        <div class="sidebar-header">YuuY 💬</div>
         <div class="setup-profile">
-            <label>Your nickname:</label>
+            <label>Ваш псевдоним:</label>
             <div class="profile-input-zone">
                 <input type="text" id="usernameInput" value="User">
-                <button onclick="updateNickname()">OK</button>
+                <button onclick="updateNickname()">ОК</button>
             </div>
         </div>
         <div class="port-search">
-            <label>Create room (Port):</label>
+            <label>Создать комнату (Порт):</label>
             <div class="port-search-row">
                 <input type="number" id="portInput" min="1" max="9999" placeholder="1-9999">
-                <button onclick="createNewPortRoom()">Create</button>
+                <button onclick="createNewPortRoom()">Создать</button>
             </div>
         </div>
         <div class="port-list" id="portList">
-            <div class="empty-list-text" id="emptyListText">No open ports.</div>
+            <div class="empty-list-text" id="emptyListText">Нет открытых портов.</div>
         </div>
     </div>
 
     <div class="chat-container">
         <div class="no-room-overlay" id="noRoomOverlay">
-            <h3>No room selected</h3>
-            <p>Create a new port in the left panel.</p>
+            <h3>Комната не выбрана</h3>
+            <p>Создайте новый порт в панели слева.</p>
         </div>
         <div class="chat-header">
-            <h2 id="currentPortTitle">Port: not selected</h2>
-            <div class="room-users-info" id="roomUsersInfo">Participants: 0 / 2</div>
+            <h2 id="currentPortTitle">Порт: не выбран</h2>
+            <div class="room-users-info" id="roomUsersInfo">Участники: 0 / 2</div>
         </div>
         <div class="messages-area" id="messagesArea"></div>
         <div class="input-area">
             <label class="file-upload-label">
                 📎 <input type="file" id="fileSelector" onchange="uploadSelectedFile(this)">
             </label>
-            <input type="text" id="messageInput" placeholder="Message..." onkeypress="handleKeyPress(event)">
+            <input type="text" id="messageInput" placeholder="Сообщение..." onkeypress="handleKeyPress(event)">
             <button class="send-btn" onclick="sendMessage()">--></button>
         </div>
     </div>
 
     <script>
-        // Initialize session
+        // Инициализация сессии
         if(!localStorage.getItem('chat_session_id')) {
             localStorage.setItem('chat_session_id', 'usr_' + Math.random().toString(36).substr(2, 9));
         }
         const sessionId = localStorage.getItem('chat_session_id');
 
-        // Check saved nickname in localStorage
+        // ВОТ ЗДЕСЬ: Проверяем сохраненный никнейм в localStorage
         if(localStorage.getItem('chat_saved_username')) {
             document.getElementById('usernameInput').value = localStorage.getItem('chat_saved_username');
         }
@@ -254,7 +254,7 @@ HTML_CODE = """
         function createNewPortRoom() {
             const input = document.getElementById('portInput');
             const port = parseInt(input.value);
-            if(!port || port < 1 || port > 9999) return alert("Invalid port");
+            if(!port || port < 1 || port > 9999) return alert("Неверный порт");
             
             fetch('/create_room', {
                 method: 'POST',
@@ -282,7 +282,7 @@ HTML_CODE = """
                 div.className = `port-item ${currentPort === port ? 'active' : ''}`;
                 div.dataset.port = port;
                 div.onclick = function() { switchPort(port, this); };
-                div.innerHTML = `<span>🚪 Port ${port}</span>`;
+                div.innerHTML = `<span>🚪 Порт ${port}</span>`;
                 list.appendChild(div);
             });
         }
@@ -308,8 +308,8 @@ HTML_CODE = """
             .then(data => {
                 myRoleName = data.user;
                 document.getElementById('usernameInput').value = myRoleName;
-                localStorage.setItem('chat_saved_username', myRoleName); // Save name on join
-                document.getElementById('currentPortTitle').innerText = `Port: ${port}`;
+                localStorage.setItem('chat_saved_username', myRoleName); // Сохраняем имя при входе
+                document.getElementById('currentPortTitle').innerText = `Порт: ${port}`;
                 updateUsersHeaderInfo(data.active_users);
                 renderMessages(data.messages);
             }).catch(e=>{});
@@ -317,13 +317,13 @@ HTML_CODE = """
 
         function updateNickname() {
             const newName = document.getElementById('usernameInput').value.trim();
-            if(!newName) return alert("Nickname is empty!");
+            if(!newName) return alert("Ник пустой!");
             
-            // Save locally anyway
+            // Сохраняем локально в любом случае
             localStorage.setItem('chat_saved_username', newName);
 
             if(!currentPort) {
-                alert("Nickname saved for future rooms!");
+                alert("Никнейм успешно сохранен для будущих комнат!");
                 return;
             }
 
@@ -340,13 +340,13 @@ HTML_CODE = """
                 if(data) { 
                     myRoleName = data.username; 
                     localStorage.setItem('chat_saved_username', myRoleName);
-                    alert("Nickname changed!"); 
+                    alert("Ник изменен!"); 
                 } 
             });
         }
 
         function updateUsersHeaderInfo(usersList) {
-            document.getElementById('roomUsersInfo').innerText = `Participants (${usersList.length}/2): ${usersList.join(', ')}`;
+            document.getElementById('roomUsersInfo').innerText = `Участники (${usersList.length}/2): ${usersList.join(', ')}`;
         }
 
         function renderMessages(messages) {
@@ -354,7 +354,7 @@ HTML_CODE = """
             area.innerHTML = '';
             messages.forEach(msg => {
                 const div = document.createElement('div');
-                if(msg.sender === 'System') {
+                if(msg.sender === 'Система') {
                     div.className = 'msg system';
                     div.innerText = msg.text;
                     area.appendChild(div);
@@ -363,9 +363,9 @@ HTML_CODE = """
                 div.className = msg.sender === myRoleName ? 'msg you' : 'msg other';
                 let html = `<div class="msg-sender">${msg.sender}</div>`;
                 if(msg.type === 'text') html += `<div>${msg.text}</div>`;
-                else if(msg.type === 'image') html += `<div>🖼️ Image: <b>${msg.filename}</b></div><a href="${msg.url}" target="_blank"><img src="${msg.url}" class="chat-image"></a>`;
-                else if(msg.type === 'text_file') html += `<div>📄 Text: <b>${msg.filename}</b></div><div class="chat-text-preview">${escapeHtml(msg.text)}</div><a href="${msg.url}" class="file-link-btn" download>📥 Download</a>`;
-                else html += `<div>📦 File: <b>${msg.filename}</b></div><a href="${msg.url}" class="file-link-btn" download>📥 Download</a>`;
+                else if(msg.type === 'image') html += `<div>🖼️ Картинка: <b>${msg.filename}</b></div><a href="${msg.url}" target="_blank"><img src="${msg.url}" class="chat-image"></a>`;
+                else if(msg.type === 'text_file') html += `<div>📄 Текст: <b>${msg.filename}</b></div><div class="chat-text-preview">${escapeHtml(msg.text)}</div><a href="${msg.url}" class="file-link-btn" download>📥 Скачать</a>`;
+                else html += `<div>📦 Файл: <b>${msg.filename}</b></div><a href="${msg.url}" class="file-link-btn" download>📥 Скачать</a>`;
                 div.innerHTML = html;
                 area.appendChild(div);
             });
@@ -375,7 +375,7 @@ HTML_CODE = """
         function uploadSelectedFile(input) {
             if(!currentPort || input.files.length === 0) return;
             const formData = new FormData();
-            formData.append('file', input.files[0]); // FIXED: send specific file, not the list
+            formData.append('file', input.files[0]); // ИСПРАВЛЕНО: отправляем конкретный файл, а не список
             formData.append('port', currentPort);
             formData.append('session_id', sessionId);
             input.value = '';
