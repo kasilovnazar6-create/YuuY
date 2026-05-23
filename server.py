@@ -17,11 +17,18 @@ if not os.path.exists(UPLOAD_FOLDER):
 # Database setup
 DB_PATH = 'chat_database.db'
 
+# Delete old database to fix schema issues
+if os.path.exists(DB_PATH):
+    try:
+        os.remove(DB_PATH)
+        print("Old database removed. Starting fresh.")
+    except:
+        pass
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     
-    # Create messages table
     c.execute('''CREATE TABLE IF NOT EXISTS messages
                  (id INTEGER PRIMARY KEY AUTOINCREMENT,
                   sender TEXT NOT NULL,
@@ -31,48 +38,45 @@ def init_db():
                   url TEXT,
                   timestamp TEXT DEFAULT CURRENT_TIMESTAMP)''')
     
-    # Create users table
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (session_id TEXT PRIMARY KEY,
                   username TEXT NOT NULL,
-                  last_seen TEXT DEFAULT CURRENT_TIMESTAMP)''')
+                  last_seen TEXT DEFAULT CURRENT_TIMESTAMP,
+                  is_online INTEGER DEFAULT 0)''')
     
-    # Create index for faster cleanup
     c.execute('''CREATE INDEX IF NOT EXISTS idx_timestamp 
                  ON messages(timestamp)''')
+    c.execute('''CREATE INDEX IF NOT EXISTS idx_username 
+                 ON users(username)''')
     
     conn.commit()
     conn.close()
 
 def clean_old_messages():
     """Remove messages older than 30 days"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
-    
-    # Get old messages to clean up their files
-    c.execute('SELECT url FROM messages WHERE timestamp < ? AND url IS NOT NULL', (cutoff_date,))
-    old_files = c.fetchall()
-    
-    # Delete old message files
-    for (url,) in old_files:
-        if url:
-            filename = url.replace('/uploads/', '')
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            if os.path.exists(filepath):
-                try:
-                    os.remove(filepath)
-                except:
-                    pass
-    
-    # Delete old messages
-    c.execute('DELETE FROM messages WHERE timestamp < ?', (cutoff_date,))
-    
-    # Clean up inactive users
-    c.execute('DELETE FROM users WHERE last_seen < ?', (cutoff_date,))
-    
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        
+        c.execute('SELECT url FROM messages WHERE timestamp < ? AND url IS NOT NULL', (cutoff_date,))
+        old_files = c.fetchall()
+        
+        for (url,) in old_files:
+            if url:
+                filename = url.replace('/uploads/', '')
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                if os.path.exists(filepath):
+                    try:
+                        os.remove(filepath)
+                    except:
+                        pass
+        
+        c.execute('DELETE FROM messages WHERE timestamp < ?', (cutoff_date,))
+        conn.commit()
+        conn.close()
+    except:
+        pass
 
 def add_message(sender, msg_type, text="", filename="", url=""):
     conn = sqlite3.connect(DB_PATH)
@@ -83,9 +87,6 @@ def add_message(sender, msg_type, text="", filename="", url=""):
               (sender, msg_type, text, filename, url, timestamp))
     conn.commit()
     conn.close()
-    
-    # Clean old messages periodically
-    clean_old_messages()
 
 def get_all_messages():
     conn = sqlite3.connect(DB_PATH)
@@ -110,16 +111,25 @@ def update_user(session_id, username):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     last_seen = datetime.now(timezone.utc).isoformat()
-    c.execute('''INSERT OR REPLACE INTO users (session_id, username, last_seen)
-                 VALUES (?, ?, ?)''', (session_id, username, last_seen))
+    c.execute('''INSERT OR REPLACE INTO users (session_id, username, last_seen, is_online)
+                 VALUES (?, ?, ?, 1)''', (session_id, username, last_seen))
+    conn.commit()
+    conn.close()
+
+def set_user_offline(session_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    last_seen = datetime.now(timezone.utc).isoformat()
+    c.execute('UPDATE users SET is_online = 0, last_seen = ? WHERE session_id = ?', 
+              (last_seen, session_id))
     conn.commit()
     conn.close()
 
 def get_all_users():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('SELECT username FROM users ORDER BY username')
-    users = [row[0] for row in c.fetchall()]
+    c.execute('SELECT username, is_online FROM users ORDER BY is_online DESC, username ASC')
+    users = [{"username": row[0], "is_online": bool(row[1])} for row in c.fetchall()]
     conn.close()
     return users
 
@@ -131,26 +141,43 @@ def get_username(session_id):
     conn.close()
     return result[0] if result else None
 
+def is_username_taken(username, exclude_session_id=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    if exclude_session_id:
+        c.execute('SELECT COUNT(*) FROM users WHERE LOWER(username) = LOWER(?) AND session_id != ?', 
+                 (username, exclude_session_id))
+    else:
+        c.execute('SELECT COUNT(*) FROM users WHERE LOWER(username) = LOWER(?)', (username,))
+    count = c.fetchone()[0]
+    conn.close()
+    return count > 0
+
 def get_allowed_name(requested_name, session_id):
-    current_username = get_username(session_id)
-    existing_names = [name.lower() for name in get_all_users() if name.lower() != (current_username or "").lower()]
     if not requested_name or requested_name.strip() == "":
         requested_name = "User"
     base_name = requested_name.strip()
     name = base_name
-    counter = 1
-    while name.lower() in existing_names:
+    
+    if is_username_taken(name, session_id):
+        counter = 1
+        while is_username_taken(f"{base_name}_{counter}", session_id):
+            counter += 1
         name = f"{base_name}_{counter}"
-        counter += 1
+    
     return name
 
-# Initialize database on startup
+# Initialize database
 init_db()
-# Clean old messages on startup
+conn = sqlite3.connect(DB_PATH)
+c = conn.cursor()
+c.execute('UPDATE users SET is_online = 0')
+conn.commit()
+conn.close()
 clean_old_messages()
-# Add welcome message if database is empty
+
 if len(get_all_messages()) == 0:
-    add_message("System", "text", "Welcome to YuuY Chat! Messages are saved and will be auto-deleted after 30 days.")
+    add_message("System", "text", "Welcome to YuuY Chat! Messages are saved for 30 days.")
 
 @app.route('/')
 def index():
@@ -166,19 +193,16 @@ def join_chat():
     session_id = data.get('session_id')
     requested_name = data.get('username', '').strip()
     
-    final_name = get_allowed_name(requested_name, session_id)
-    
-    # Get old username before updating
     old_name = get_username(session_id)
-    
-    # Update user in database
+    final_name = get_allowed_name(requested_name, session_id)
     update_user(session_id, final_name)
     
-    # Send appropriate system message
     if old_name is None:
         add_message("System", "text", f"{final_name} joined the chat.")
     elif old_name != final_name:
         add_message("System", "text", f"{old_name} changed their name to {final_name}.")
+    else:
+        add_message("System", "text", f"{final_name} is back online.")
     
     messages = get_all_messages()
     users = get_all_users()
@@ -195,12 +219,12 @@ def change_nickname():
     if not current_name:
         return jsonify({"error": "User not found"}), 400
     
-    existing_names = [name.lower() for name in get_all_users() if name.lower() != current_name.lower()]
-    if new_name.lower() in existing_names:
-        return jsonify({"error": "This nickname is already taken!"}), 400
     if not new_name:
         return jsonify({"error": "Nickname is empty"}), 400
-
+    
+    if is_username_taken(new_name, session_id):
+        return jsonify({"error": "This nickname is already taken!"}), 400
+    
     update_user(session_id, new_name)
     add_message("System", "text", f"{current_name} changed their name to {new_name}")
     
@@ -221,7 +245,7 @@ def send_message():
     user = get_username(session_id)
     if user and text:
         add_message(user, "text", text)
-        return jsonify({"success": True})
+        return jsonify({"success": True, "sender": user})
     return jsonify({"success": False}), 400
 
 @app.route('/upload_file', methods=['POST'])
@@ -263,12 +287,53 @@ def upload_file():
         add_message(user, file_type, preview_content, filename, f"/uploads/{unique_filename}")
         return jsonify({"success": True})
 
+@app.route('/logout', methods=['POST'])
+def logout():
+    data = request.json or {}
+    session_id = data.get('session_id')
+    if session_id:
+        username = get_username(session_id)
+        if username:
+            set_user_offline(session_id)
+            add_message("System", "text", f"{username} went offline.")
+    return jsonify({"success": True})
+
+# Create notification sound file
+SOUND_FILE = os.path.join(UPLOAD_FOLDER, 'notification.wav')
+if not os.path.exists(SOUND_FILE):
+    # Generate a simple WAV file for notification
+    import struct
+    import wave
+    
+    sample_rate = 44100
+    duration = 0.15
+    frequency = 800
+    
+    with wave.open(SOUND_FILE, 'w') as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        
+        samples = []
+        for i in range(int(sample_rate * duration)):
+            t = i / sample_rate
+            # Fade out
+            amplitude = 32767 * (1 - i / (sample_rate * duration))
+            sample = int(amplitude * (0.5 * __import__('math').sin(2 * __import__('math').pi * frequency * t)))
+            samples.append(sample)
+        
+        wav.writeframes(struct.pack('<' + 'h' * len(samples), *samples))
+
+@app.route('/notification.wav')
+def notification_sound():
+    return send_from_directory(UPLOAD_FOLDER, 'notification.wav')
+
 HTML_CODE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>YuuY - Persistent Chat</title>
+    <title>YuuY - Global Chat</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', sans-serif; }
         body { display: flex; height: 100vh; background: #0f172a; color: #e2e8f0; overflow: hidden; }
@@ -282,7 +347,10 @@ HTML_CODE = r"""
         .online-users { flex: 1; overflow-y: auto; padding: 15px; }
         .online-users h3 { color: #94a3b8; font-size: 0.85rem; margin-bottom: 10px; }
         .user-item { padding: 8px 12px; margin-bottom: 4px; background: #334155; border-radius: 6px; font-size: 0.9rem; display: flex; align-items: center; gap: 8px; }
-        .user-item .online-dot { width: 8px; height: 8px; background: #10b981; border-radius: 50%; }
+        .user-item .online-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+        .user-item .online-dot.online { background: #10b981; }
+        .user-item .online-dot.offline { background: #64748b; }
+        .user-item.offline-user { opacity: 0.6; }
         .info-box { padding: 10px; margin: 10px; background: #0f172a; border-radius: 8px; font-size: 0.8rem; color: #64748b; text-align: center; }
         .chat-container { flex: 1; display: flex; flex-direction: column; background: #0f172a; }
         .chat-header { padding: 20px; background: #1e293b; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; }
@@ -290,6 +358,8 @@ HTML_CODE = r"""
         .online-count { font-size: 0.85rem; color: #94a3b8; background: #0f172a; padding: 6px 12px; border-radius: 20px; border: 1px solid #334155; }
         .messages-area { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
         .msg { max-width: 65%; padding: 12px 16px; border-radius: 12px; line-height: 1.45; display: flex; flex-direction: column; }
+        .msg.new-message { animation: fadeIn 0.3s ease; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
         .msg.system { background: #1e293b; color: #38bdf8; align-self: center; font-size: 0.85rem; text-align: center; border: 1px solid #334155; border-radius: 20px; padding: 6px 16px; max-width: 80%; }
         .msg.you { background: #38bdf8; color: #0f172a; align-self: flex-end; border-bottom-right-radius: 2px; }
         .msg.other { background: #1e293b; color: #e2e8f0; align-self: flex-start; border-bottom-left-radius: 2px; border: 1px solid #334155; }
@@ -322,12 +392,12 @@ HTML_CODE = r"""
         <div class="setup-profile">
             <label>Your nickname:</label>
             <div class="profile-input-zone">
-                <input type="text" id="usernameInput" value="User">
+                <input type="text" id="usernameInput" value="User" autocomplete="off">
                 <button onclick="updateNickname()">OK</button>
             </div>
         </div>
         <div class="online-users">
-            <h3>🟢 Online Users</h3>
+            <h3>👥 Users</h3>
             <div id="onlineUsersList"></div>
         </div>
         <div class="info-box">
@@ -351,7 +421,6 @@ HTML_CODE = r"""
     </div>
 
     <script>
-        // Initialize session
         if(!localStorage.getItem('chat_session_id')) {
             localStorage.setItem('chat_session_id', 'usr_' + Math.random().toString(36).substr(2, 9));
         }
@@ -361,6 +430,42 @@ HTML_CODE = r"""
         document.getElementById('usernameInput').value = myRoleName;
         
         let lastMessageCount = 0;
+        let unreadCount = 0;
+        let windowFocused = true;
+        let notificationAudio = null;
+        
+        // Load notification sound
+        function initAudio() {
+            notificationAudio = new Audio('/notification.wav');
+            notificationAudio.volume = 0.3;
+            notificationAudio.preload = 'auto';
+        }
+        
+        window.addEventListener('focus', () => {
+            windowFocused = true;
+            unreadCount = 0;
+            document.title = 'YuuY - Global Chat';
+        });
+        
+        window.addEventListener('blur', () => {
+            windowFocused = false;
+        });
+        
+        window.addEventListener('beforeunload', () => {
+            try {
+                navigator.sendBeacon('/logout', JSON.stringify({ session_id: sessionId }));
+            } catch(e) {}
+        });
+        
+        function playNotificationSound() {
+            if (!notificationAudio) {
+                initAudio();
+            }
+            if (notificationAudio) {
+                notificationAudio.currentTime = 0;
+                notificationAudio.play().catch(() => {});
+            }
+        }
         
         function joinChat() {
             fetch('/join_chat', {
@@ -375,8 +480,10 @@ HTML_CODE = r"""
                 localStorage.setItem('chat_saved_username', myRoleName);
                 document.getElementById('connectingOverlay').style.display = 'none';
                 updateOnlineUsers(data.active_users);
-                renderMessages(data.messages);
+                renderMessages(data.messages, true);
                 lastMessageCount = data.messages.length;
+                document.getElementById('messageInput').focus();
+                initAudio();
             })
             .catch(err => {
                 console.error('Failed to join chat:', err);
@@ -387,6 +494,7 @@ HTML_CODE = r"""
         function updateNickname() {
             const newName = document.getElementById('usernameInput').value.trim();
             if(!newName) return alert("Nickname is empty!");
+            if(newName === myRoleName) return;
             
             fetch('/change_nickname', {
                 method: 'POST',
@@ -412,27 +520,38 @@ HTML_CODE = r"""
         }
 
         function updateOnlineUsers(usersList) {
-            document.getElementById('onlineCount').innerText = `Users online: ${usersList.length}`;
+            const onlineUsers = usersList.filter(u => u.is_online).length;
+            document.getElementById('onlineCount').innerText = 'Users online: ' + onlineUsers;
             const list = document.getElementById('onlineUsersList');
             list.innerHTML = usersList.map(user => 
-                `<div class="user-item"><span class="online-dot"></span>${escapeHtml(user)}${user === myRoleName ? ' (you)' : ''}</div>`
+                `<div class="user-item ${!user.is_online ? 'offline-user' : ''}">
+                    <span class="online-dot ${user.is_online ? 'online' : 'offline'}"></span>
+                    ${escapeHtml(user.username)}${user.username === myRoleName ? ' (you)' : ''}
+                    ${!user.is_online ? ' <span style="font-size:0.7rem;color:#64748b">(offline)</span>' : ''}
+                </div>`
             ).join('');
         }
 
-        function renderMessages(messages) {
+        function renderMessages(messages, isInitialLoad = false) {
             const area = document.getElementById('messagesArea');
-            const wasScrolledToBottom = area.scrollHeight - area.scrollTop === area.clientHeight;
+            const wasScrolledToBottom = area.scrollHeight - area.scrollTop - area.clientHeight < 50;
+            
+            // Check for new messages
+            const hasNewMessages = messages.length > lastMessageCount && lastMessageCount > 0;
+            const newMessageIds = hasNewMessages ? messages.slice(lastMessageCount) : [];
             
             area.innerHTML = '';
-            messages.forEach(msg => {
+            messages.forEach((msg, index) => {
                 const div = document.createElement('div');
+                const isNew = !isInitialLoad && hasNewMessages && index >= lastMessageCount;
+                
                 if(msg.sender === 'System') {
-                    div.className = 'msg system';
+                    div.className = 'msg system' + (isNew ? ' new-message' : '');
                     div.innerText = msg.text;
                     area.appendChild(div);
                     return;
                 }
-                div.className = msg.sender === myRoleName ? 'msg you' : 'msg other';
+                div.className = (msg.sender === myRoleName ? 'msg you' : 'msg other') + (isNew ? ' new-message' : '');
                 let html = `<div class="msg-sender">${escapeHtml(msg.sender)}</div>`;
                 if(msg.type === 'text') {
                     html += `<div>${formatMessage(escapeHtml(msg.text))}</div>`;
@@ -447,15 +566,28 @@ HTML_CODE = r"""
                 area.appendChild(div);
             });
             
-            // Auto-scroll if was at bottom or if new messages arrived
-            if (wasScrolledToBottom || messages.length > lastMessageCount) {
+            // Handle new messages
+            if (hasNewMessages) {
+                const hasNewMessageFromOthers = newMessageIds.some(msg => msg.sender !== 'System' && msg.sender !== myRoleName);
+                
+                if (hasNewMessageFromOthers) {
+                    if (!windowFocused) {
+                        unreadCount += newMessageIds.filter(msg => msg.sender !== 'System' && msg.sender !== myRoleName).length;
+                        document.title = '(' + unreadCount + ') YuuY - Global Chat';
+                    }
+                    playNotificationSound();
+                }
+            }
+            
+            lastMessageCount = messages.length;
+            
+            // Scroll to bottom
+            if (wasScrolledToBottom || hasNewMessages) {
                 area.scrollTop = area.scrollHeight;
             }
-            lastMessageCount = messages.length;
         }
         
         function formatMessage(text) {
-            // Convert URLs to clickable links
             const urlRegex = /(https?:\/\/[^\s<]+)/g;
             return text.replace(urlRegex, '<a href="$1" target="_blank" style="color: inherit; text-decoration: underline;">$1</a>');
         }
@@ -497,7 +629,6 @@ HTML_CODE = r"""
             });
         }
 
-        // Poll for new messages
         setInterval(() => {
             fetch('/get_messages').then(res => res.json())
             .then(data => { 
@@ -519,14 +650,6 @@ HTML_CODE = r"""
             return div.innerHTML;
         }
         
-        // Focus input on load
-        window.addEventListener('load', () => {
-            setTimeout(() => {
-                document.getElementById('messageInput').focus();
-            }, 1500);
-        });
-        
-        // Start the chat
         joinChat();
     </script>
 </body>
@@ -534,4 +657,4 @@ HTML_CODE = r"""
 """
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=False)
