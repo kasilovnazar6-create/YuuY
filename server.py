@@ -1,4 +1,7 @@
 import os
+import sqlite3
+import json
+from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template_string, request, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 
@@ -11,11 +14,126 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB limit
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
-# In-memory room database
-rooms_data = {}
+# Database setup
+DB_PATH = 'chat_database.db'
 
-def get_allowed_name(room, requested_name, session_id):
-    existing_names = [name.lower() for sid, name in room["users"].items() if sid != session_id]
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Create messages table
+    c.execute('''CREATE TABLE IF NOT EXISTS messages
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  sender TEXT NOT NULL,
+                  type TEXT NOT NULL,
+                  text TEXT,
+                  filename TEXT,
+                  url TEXT,
+                  timestamp TEXT DEFAULT CURRENT_TIMESTAMP)''')
+    
+    # Create users table
+    c.execute('''CREATE TABLE IF NOT EXISTS users
+                 (session_id TEXT PRIMARY KEY,
+                  username TEXT NOT NULL,
+                  last_seen TEXT DEFAULT CURRENT_TIMESTAMP)''')
+    
+    # Create index for faster cleanup
+    c.execute('''CREATE INDEX IF NOT EXISTS idx_timestamp 
+                 ON messages(timestamp)''')
+    
+    conn.commit()
+    conn.close()
+
+def clean_old_messages():
+    """Remove messages older than 30 days"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    
+    # Get old messages to clean up their files
+    c.execute('SELECT url FROM messages WHERE timestamp < ? AND url IS NOT NULL', (cutoff_date,))
+    old_files = c.fetchall()
+    
+    # Delete old message files
+    for (url,) in old_files:
+        if url:
+            filename = url.replace('/uploads/', '')
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            if os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except:
+                    pass
+    
+    # Delete old messages
+    c.execute('DELETE FROM messages WHERE timestamp < ?', (cutoff_date,))
+    
+    # Clean up inactive users
+    c.execute('DELETE FROM users WHERE last_seen < ?', (cutoff_date,))
+    
+    conn.commit()
+    conn.close()
+
+def add_message(sender, msg_type, text="", filename="", url=""):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    timestamp = datetime.now(timezone.utc).isoformat()
+    c.execute('''INSERT INTO messages (sender, type, text, filename, url, timestamp)
+                 VALUES (?, ?, ?, ?, ?, ?)''',
+              (sender, msg_type, text, filename, url, timestamp))
+    conn.commit()
+    conn.close()
+    
+    # Clean old messages periodically
+    clean_old_messages()
+
+def get_all_messages():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''SELECT sender, type, text, filename, url 
+                 FROM messages 
+                 ORDER BY id ASC''')
+    messages = []
+    for row in c.fetchall():
+        msg = {
+            "sender": row[0],
+            "type": row[1],
+            "text": row[2] if row[2] else "",
+            "filename": row[3] if row[3] else "",
+            "url": row[4] if row[4] else ""
+        }
+        messages.append(msg)
+    conn.close()
+    return messages
+
+def update_user(session_id, username):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    last_seen = datetime.now(timezone.utc).isoformat()
+    c.execute('''INSERT OR REPLACE INTO users (session_id, username, last_seen)
+                 VALUES (?, ?, ?)''', (session_id, username, last_seen))
+    conn.commit()
+    conn.close()
+
+def get_all_users():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT username FROM users ORDER BY username')
+    users = [row[0] for row in c.fetchall()]
+    conn.close()
+    return users
+
+def get_username(session_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT username FROM users WHERE session_id = ?', (session_id,))
+    result = c.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+def get_allowed_name(requested_name, session_id):
+    current_username = get_username(session_id)
+    existing_names = [name.lower() for name in get_all_users() if name.lower() != (current_username or "").lower()]
     if not requested_name or requested_name.strip() == "":
         requested_name = "User"
     base_name = requested_name.strip()
@@ -26,6 +144,14 @@ def get_allowed_name(room, requested_name, session_id):
         counter += 1
     return name
 
+# Initialize database on startup
+init_db()
+# Clean old messages on startup
+clean_old_messages()
+# Add welcome message if database is empty
+if len(get_all_messages()) == 0:
+    add_message("System", "text", "Welcome to YuuY Chat! Messages are saved and will be auto-deleted after 30 days.")
+
 @app.route('/')
 def index():
     return render_template_string(HTML_CODE)
@@ -34,107 +160,98 @@ def index():
 def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
-@app.route('/create_room', methods=['POST'])
-def create_room():
+@app.route('/join_chat', methods=['POST'])
+def join_chat():
     data = request.json or {}
-    port = int(data.get('port', 0))
-    if port < 1 or port > 9999:
-        return jsonify({"error": "Port must be between 1 and 9999"}), 400
-    if port in rooms_data:
-        return jsonify({"success": True})
-    rooms_data[port] = {
-        "users": {},
-        "messages": [{"sender": "System", "type": "text", "text": f"Room on port {port} created!"}]
-    }
-    return jsonify({"success": True})
-
-@app.route('/join_room', methods=['POST'])
-def join_room():
-    data = request.json or {}
-    port = int(data.get('port', 0))
     session_id = data.get('session_id')
     requested_name = data.get('username', '').strip()
     
-    if port not in rooms_data:
-        return jsonify({"error": f"Room {port} hasn't been created yet!"}), 404
-        
-    room = rooms_data[port]
-    if session_id not in room["users"] and len(room["users"]) >= 2:
-        return jsonify({"error": f"Room {port} already has 2 participants!"}), 403
-        
-    final_name = get_allowed_name(room, requested_name, session_id)
-    if session_id not in room["users"]:
-        room["users"][session_id] = final_name
-        room["messages"].append({"sender": "System", "type": "text", "text": f"{final_name} joined the room."})
-    elif room["users"][session_id] != final_name:
-        old_name = room["users"][session_id]
-        room["users"][session_id] = final_name
-        room["messages"].append({"sender": "System", "type": "text", "text": f"{old_name} changed to {final_name}."})
-        
-    return jsonify({"user": final_name, "messages": room["messages"], "active_users": list(room["users"].values())})
+    final_name = get_allowed_name(requested_name, session_id)
+    
+    # Get old username before updating
+    old_name = get_username(session_id)
+    
+    # Update user in database
+    update_user(session_id, final_name)
+    
+    # Send appropriate system message
+    if old_name is None:
+        add_message("System", "text", f"{final_name} joined the chat.")
+    elif old_name != final_name:
+        add_message("System", "text", f"{old_name} changed their name to {final_name}.")
+    
+    messages = get_all_messages()
+    users = get_all_users()
+    
+    return jsonify({"user": final_name, "messages": messages, "active_users": users})
 
 @app.route('/change_nickname', methods=['POST'])
 def change_nickname():
     data = request.json or {}
-    port = int(data.get('port', 0))
     session_id = data.get('session_id')
     new_name = data.get('username', '').strip()
     
-    if port not in rooms_data or session_id not in rooms_data[port]["users"]:
-        return jsonify({"error": "Room not found"}), 400
-    room = rooms_data[port]
-    existing_names = [name.lower() for sid, name in room["users"].items() if sid != session_id]
+    current_name = get_username(session_id)
+    if not current_name:
+        return jsonify({"error": "User not found"}), 400
+    
+    existing_names = [name.lower() for name in get_all_users() if name.lower() != current_name.lower()]
     if new_name.lower() in existing_names:
         return jsonify({"error": "This nickname is already taken!"}), 400
     if not new_name:
         return jsonify({"error": "Nickname is empty"}), 400
 
-    old_name = room["users"][session_id]
-    room["users"][session_id] = new_name
-    room["messages"].append({"sender": "System", "type": "text", "text": f"{old_name} changed their name to {new_name}"})
+    update_user(session_id, new_name)
+    add_message("System", "text", f"{current_name} changed their name to {new_name}")
+    
     return jsonify({"success": True, "username": new_name})
 
-@app.route('/get_messages/<int:port>', methods=['GET'])
-def get_messages(port):
-    if port in rooms_data:
-        return jsonify({"messages": rooms_data[port]["messages"], "users": list(rooms_data[port]["users"].values())})
-    return jsonify({"messages": [], "users": []})
+@app.route('/get_messages', methods=['GET'])
+def get_messages():
+    messages = get_all_messages()
+    users = get_all_users()
+    return jsonify({"messages": messages, "users": users})
 
 @app.route('/send_message', methods=['POST'])
 def send_message():
     data = request.json or {}
-    port = int(data.get('port', 0))
     session_id = data.get('session_id')
     text = data.get('text')
-    if port in rooms_data and session_id in rooms_data[port]["users"] and text:
-        user = rooms_data[port]['users'][session_id]
-        rooms_data[port]['messages'].append({"sender": user, "type": "text", "text": text})
+    
+    user = get_username(session_id)
+    if user and text:
+        add_message(user, "text", text)
         return jsonify({"success": True})
     return jsonify({"success": False}), 400
 
 @app.route('/upload_file', methods=['POST'])
 def upload_file():
-    port = int(request.form.get('port', 0))
     session_id = request.form.get('session_id')
-    if port not in rooms_data or session_id not in rooms_data[port]["users"]:
+    user = get_username(session_id)
+    
+    if not user:
         return jsonify({"error": "Session error"}), 400
     if 'file' not in request.files:
         return jsonify({"error": "File not found"}), 400
+    
     file = request.files['file']
     if file.filename == '':
         return jsonify({"error": "No file selected"}), 400
+    
     if file:
         filename = secure_filename(file.filename)
-        unique_filename = f"{port}_{session_id[:4]}_{filename}"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        unique_filename = f"{timestamp}_{session_id[:8]}_{filename}"
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
         file.save(file_path)
-        user = rooms_data[port]['users'][session_id]
+        
         ext = filename.split('.')[-1].lower()
         file_type = "file"
         if ext in ['jpg', 'jpeg', 'png', 'gif', 'webp']:
             file_type = "image"
         elif ext in ['txt', 'log', 'py', 'json', 'md']:
             file_type = "text_file"
+        
         preview_content = ""
         if file_type == "text_file":
             try:
@@ -142,61 +259,66 @@ def upload_file():
                     preview_content = f.read(1000)
             except Exception:
                 preview_content = "Preview read error."
-        rooms_data[port]['messages'].append({
-            "sender": user, "type": file_type, "filename": filename, "url": f"/uploads/{unique_filename}", "text": preview_content
-        })
+        
+        add_message(user, file_type, preview_content, filename, f"/uploads/{unique_filename}")
         return jsonify({"success": True})
 
-HTML_CODE = """
+HTML_CODE = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>YuuY ╰（‵□′）╯</title>
+    <title>YuuY - Persistent Chat</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', sans-serif; }
         body { display: flex; height: 100vh; background: #0f172a; color: #e2e8f0; overflow: hidden; }
-        .sidebar { width: 320px; background: #1e293b; display: flex; flex-direction: column; border-right: 1px solid #334155; }
-        .sidebar-header { padding: 20px; font-size: 1.1rem; font-weight: bold; background: #0f172a; text-align: center; color: #38bdf8; }
+        .sidebar { width: 280px; background: #1e293b; display: flex; flex-direction: column; border-right: 1px solid #334155; }
+        .sidebar-header { padding: 20px; font-size: 1.3rem; font-weight: bold; background: #0f172a; text-align: center; color: #38bdf8; }
         .setup-profile { padding: 15px; background: #1e293b; border-bottom: 1px solid #334155; display: flex; flex-direction: column; gap: 8px; }
         .setup-profile label { font-size: 0.8rem; color: #94a3b8; font-weight: bold; }
         .profile-input-zone { display: flex; gap: 8px; }
         .setup-profile input { flex: 1; padding: 8px 12px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: white; outline: none; }
         .setup-profile button { padding: 8px 12px; border: none; background: #10b981; color: white; font-weight: bold; border-radius: 6px; cursor: pointer; }
-        .port-search { padding: 15px; display: flex; flex-direction: column; gap: 8px; background: #0f172a; margin: 10px; border-radius: 8px; }
-        .port-search-row { display: flex; gap: 8px; }
-        .port-search input { flex: 1; padding: 10px; border-radius: 6px; border: 1px solid #475569; background: #1e293b; color: white; outline: none; }
-        .port-search button { padding: 10px 15px; border: none; background: #38bdf8; color: #0f172a; font-weight: bold; border-radius: 6px; cursor: pointer; }
-        .port-list { flex: 1; overflow-y: auto; padding: 10px; }
-        .port-item { padding: 14px; margin-bottom: 8px; background: #334155; border-radius: 8px; cursor: pointer; display: flex; justify-content: space-between; align-items: center; }
-        .port-item.active { background: #38bdf8; color: #0f172a; font-weight: bold; }
-        .empty-list-text { text-align: center; color: #64748b; margin-top: 20px; font-size: 0.9rem; }
-        .chat-container { flex: 1; display: flex; flex-direction: column; background: #0f172a; position: relative; }
+        .online-users { flex: 1; overflow-y: auto; padding: 15px; }
+        .online-users h3 { color: #94a3b8; font-size: 0.85rem; margin-bottom: 10px; }
+        .user-item { padding: 8px 12px; margin-bottom: 4px; background: #334155; border-radius: 6px; font-size: 0.9rem; display: flex; align-items: center; gap: 8px; }
+        .user-item .online-dot { width: 8px; height: 8px; background: #10b981; border-radius: 50%; }
+        .info-box { padding: 10px; margin: 10px; background: #0f172a; border-radius: 8px; font-size: 0.8rem; color: #64748b; text-align: center; }
+        .chat-container { flex: 1; display: flex; flex-direction: column; background: #0f172a; }
         .chat-header { padding: 20px; background: #1e293b; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; }
         .chat-header h2 { color: #38bdf8; font-size: 1.2rem; }
-        .room-users-info { font-size: 0.85rem; color: #94a3b8; background: #0f172a; padding: 6px 12px; border-radius: 20px; border: 1px solid #334155; }
+        .online-count { font-size: 0.85rem; color: #94a3b8; background: #0f172a; padding: 6px 12px; border-radius: 20px; border: 1px solid #334155; }
         .messages-area { flex: 1; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
         .msg { max-width: 65%; padding: 12px 16px; border-radius: 12px; line-height: 1.45; display: flex; flex-direction: column; }
-        .msg.system { background: #1e293b; color: #38bdf8; align-self: center; font-size: 0.85rem; text-align: center; border: 1px solid #334155; border-radius: 20px; padding: 6px 16px; }
+        .msg.system { background: #1e293b; color: #38bdf8; align-self: center; font-size: 0.85rem; text-align: center; border: 1px solid #334155; border-radius: 20px; padding: 6px 16px; max-width: 80%; }
         .msg.you { background: #38bdf8; color: #0f172a; align-self: flex-end; border-bottom-right-radius: 2px; }
         .msg.other { background: #1e293b; color: #e2e8f0; align-self: flex-start; border-bottom-left-radius: 2px; border: 1px solid #334155; }
         .msg-sender { font-size: 0.75rem; font-weight: bold; margin-bottom: 6px; opacity: 0.8; }
         .chat-image { max-width: 100%; max-height: 250px; border-radius: 8px; margin-top: 5px; }
-        .chat-text-preview { background: #0f172a; color: #10b981; font-family: monospace; padding: 10px; border-radius: 6px; font-size: 0.85rem; margin-top: 6px; max-height: 150px; overflow-y: auto; }
-        .file-link-btn { display: inline-flex; background: #475569; color: white; padding: 8px 12px; border-radius: 6px; text-decoration: none; font-size: 0.85rem; margin-top: 5px; font-weight: bold; }
+        .chat-text-preview { background: #0f172a; color: #10b981; font-family: monospace; padding: 10px; border-radius: 6px; font-size: 0.85rem; margin-top: 6px; max-height: 150px; overflow-y: auto; white-space: pre-wrap; }
+        .file-link-btn { display: inline-flex; background: #475569; color: white; padding: 8px 12px; border-radius: 6px; text-decoration: none; font-size: 0.85rem; margin-top: 5px; font-weight: bold; align-items: center; gap: 4px; }
         .msg.you .file-link-btn { background: #0f172a; color: #38bdf8; }
         .input-area { padding: 20px; background: #1e293b; display: flex; gap: 12px; border-top: 1px solid #334155; align-items: center; }
         .input-area input[type="text"] { flex: 1; padding: 14px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: white; outline: none; }
         .input-area button.send-btn { padding: 14px 24px; border: none; background: #38bdf8; color: #0f172a; font-weight: bold; border-radius: 8px; cursor: pointer; }
-        .file-upload-label { padding: 13px; background: #475569; color: white; border-radius: 8px; cursor: pointer; }
+        .file-upload-label { padding: 13px; background: #475569; color: white; border-radius: 8px; cursor: pointer; transition: background 0.2s; }
+        .file-upload-label:hover { background: #5a6a82; }
         .file-upload-label input { display: none; }
-        .no-room-overlay { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: #0f172a; display: flex; flex-direction: column; justify-content: center; align-items: center; color: #64748b; z-index: 10; }
-        .no-room-overlay h3 { color: #38bdf8; margin-bottom: 10px; }
+        .connecting-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: #0f172a; display: flex; flex-direction: column; justify-content: center; align-items: center; color: #64748b; z-index: 100; }
+        .connecting-overlay h3 { color: #38bdf8; margin-bottom: 10px; font-size: 2rem; }
+        .connecting-overlay .spinner { width: 40px; height: 40px; border: 3px solid #334155; border-top: 3px solid #38bdf8; border-radius: 50%; animation: spin 1s linear infinite; margin-top: 20px; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
+    <div class="connecting-overlay" id="connectingOverlay">
+        <h3>YuuY</h3>
+        <p>Connecting to chat...</p>
+        <div class="spinner"></div>
+    </div>
+    
     <div class="sidebar">
-        <div class="sidebar-header">⚙️ CONTROL HUB</div>
+        <div class="sidebar-header">💬 YuuY Chat</div>
         <div class="setup-profile">
             <label>Your nickname:</label>
             <div class="profile-input-zone">
@@ -204,34 +326,27 @@ HTML_CODE = """
                 <button onclick="updateNickname()">OK</button>
             </div>
         </div>
-        <div class="port-search">
-            <label>Create room (Port):</label>
-            <div class="port-search-row">
-                <input type="number" id="portInput" min="1" max="9999" placeholder="1-9999">
-                <button onclick="createNewPortRoom()">Create</button>
-            </div>
+        <div class="online-users">
+            <h3>🟢 Online Users</h3>
+            <div id="onlineUsersList"></div>
         </div>
-        <div class="port-list" id="portList">
-            <div class="empty-list-text" id="emptyListText">No open ports.</div>
+        <div class="info-box">
+            💾 Messages persist for 30 days
         </div>
     </div>
 
     <div class="chat-container">
-        <div class="no-room-overlay" id="noRoomOverlay">
-            <h3>No room selected</h3>
-            <p>Create a new port in the left panel.</p>
-        </div>
         <div class="chat-header">
-            <h2 id="currentPortTitle">Port: not selected</h2>
-            <div class="room-users-info" id="roomUsersInfo">Participants: 0 / 2</div>
+            <h2>🌐 Global Chat</h2>
+            <div class="online-count" id="onlineCount">Users online: 0</div>
         </div>
         <div class="messages-area" id="messagesArea"></div>
         <div class="input-area">
             <label class="file-upload-label">
                 📎 <input type="file" id="fileSelector" onchange="uploadSelectedFile(this)">
             </label>
-            <input type="text" id="messageInput" placeholder="Message..." onkeypress="handleKeyPress(event)">
-            <button class="send-btn" onclick="sendMessage()">--></button>
+            <input type="text" id="messageInput" placeholder="Type a message..." onkeypress="handleKeyPress(event)" autocomplete="off">
+            <button class="send-btn" onclick="sendMessage()">Send</button>
         </div>
     </div>
 
@@ -241,116 +356,73 @@ HTML_CODE = """
             localStorage.setItem('chat_session_id', 'usr_' + Math.random().toString(36).substr(2, 9));
         }
         const sessionId = localStorage.getItem('chat_session_id');
-
-        // Check saved nickname in localStorage
-        if(localStorage.getItem('chat_saved_username')) {
-            document.getElementById('usernameInput').value = localStorage.getItem('chat_saved_username');
-        }
         
-        let currentPort = null;
-        let myRoleName = document.getElementById('usernameInput').value;
-        let localCreatedPorts = new Set();
-
-        function createNewPortRoom() {
-            const input = document.getElementById('portInput');
-            const port = parseInt(input.value);
-            if(!port || port < 1 || port > 9999) return alert("Invalid port");
-            
-            fetch('/create_room', {
+        let myRoleName = localStorage.getItem('chat_saved_username') || 'User';
+        document.getElementById('usernameInput').value = myRoleName;
+        
+        let lastMessageCount = 0;
+        
+        function joinChat() {
+            fetch('/join_chat', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ port: port })
+                body: JSON.stringify({ session_id: sessionId, username: myRoleName })
             })
             .then(res => res.json())
             .then(data => {
-                localCreatedPorts.add(port);
-                renderPortList();
-                input.value = '';
-                const items = document.querySelectorAll('.port-item');
-                const target = Array.from(items).find(el => el.dataset.port == port);
-                if(target) switchPort(port, target);
-            });
-        }
-
-        function renderPortList() {
-            const list = document.getElementById('portList');
-            document.getElementById('emptyListText').style.display = localCreatedPorts.size === 0 ? "block" : "none";
-            list.querySelectorAll('.port-item').forEach(item => item.remove());
-
-            Array.from(localCreatedPorts).sort((a,b)=>a-b).forEach(port => {
-                const div = document.createElement('div');
-                div.className = `port-item ${currentPort === port ? 'active' : ''}`;
-                div.dataset.port = port;
-                div.onclick = function() { switchPort(port, this); };
-                div.innerHTML = `<span>🚪 Port ${port}</span>`;
-                list.appendChild(div);
-            });
-        }
-
-        function switchPort(port, element) {
-            currentPort = port;
-            document.getElementById('noRoomOverlay').style.display = "none";
-            document.querySelectorAll('.port-item').forEach(el => el.classList.remove('active'));
-            if(element) element.classList.add('active');
-
-            fetch('/join_room', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ port: port, session_id: sessionId, username: document.getElementById('usernameInput').value })
-            })
-            .then(res => {
-                if(!res.ok) {
-                    res.json().then(data => { alert(data.error); document.getElementById('noRoomOverlay').style.display = "flex"; currentPort = null; renderPortList(); });
-                    throw new Error("Full");
-                }
-                return res.json();
-            })
-            .then(data => {
                 myRoleName = data.user;
                 document.getElementById('usernameInput').value = myRoleName;
-                localStorage.setItem('chat_saved_username', myRoleName); // Save name on join
-                document.getElementById('currentPortTitle').innerText = `Port: ${port}`;
-                updateUsersHeaderInfo(data.active_users);
+                localStorage.setItem('chat_saved_username', myRoleName);
+                document.getElementById('connectingOverlay').style.display = 'none';
+                updateOnlineUsers(data.active_users);
                 renderMessages(data.messages);
-            }).catch(e=>{});
+                lastMessageCount = data.messages.length;
+            })
+            .catch(err => {
+                console.error('Failed to join chat:', err);
+                document.getElementById('connectingOverlay').innerHTML = '<h3>Connection Error</h3><p>Please refresh the page</p>';
+            });
         }
 
         function updateNickname() {
             const newName = document.getElementById('usernameInput').value.trim();
             if(!newName) return alert("Nickname is empty!");
             
-            // Save locally anyway
-            localStorage.setItem('chat_saved_username', newName);
-
-            if(!currentPort) {
-                alert("Nickname saved for future rooms!");
-                return;
-            }
-
             fetch('/change_nickname', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ port: currentPort, session_id: sessionId, username: newName })
+                body: JSON.stringify({ session_id: sessionId, username: newName })
             })
             .then(res => {
-                if(!res.ok) { res.json().then(data => alert(data.error)); return; }
+                if(!res.ok) { 
+                    res.json().then(data => {
+                        alert(data.error);
+                        document.getElementById('usernameInput').value = myRoleName;
+                    }); 
+                    return; 
+                }
                 return res.json();
             })
             .then(data => { 
-                if(data) { 
+                if(data && data.success) { 
                     myRoleName = data.username; 
                     localStorage.setItem('chat_saved_username', myRoleName);
-                    alert("Nickname changed!"); 
                 } 
             });
         }
 
-        function updateUsersHeaderInfo(usersList) {
-            document.getElementById('roomUsersInfo').innerText = `Participants (${usersList.length}/2): ${usersList.join(', ')}`;
+        function updateOnlineUsers(usersList) {
+            document.getElementById('onlineCount').innerText = `Users online: ${usersList.length}`;
+            const list = document.getElementById('onlineUsersList');
+            list.innerHTML = usersList.map(user => 
+                `<div class="user-item"><span class="online-dot"></span>${escapeHtml(user)}${user === myRoleName ? ' (you)' : ''}</div>`
+            ).join('');
         }
 
         function renderMessages(messages) {
             const area = document.getElementById('messagesArea');
+            const wasScrolledToBottom = area.scrollHeight - area.scrollTop === area.clientHeight;
+            
             area.innerHTML = '';
             messages.forEach(msg => {
                 const div = document.createElement('div');
@@ -361,49 +433,101 @@ HTML_CODE = """
                     return;
                 }
                 div.className = msg.sender === myRoleName ? 'msg you' : 'msg other';
-                let html = `<div class="msg-sender">${msg.sender}</div>`;
-                if(msg.type === 'text') html += `<div>${msg.text}</div>`;
-                else if(msg.type === 'image') html += `<div>🖼️ Image: <b>${msg.filename}</b></div><a href="${msg.url}" target="_blank"><img src="${msg.url}" class="chat-image"></a>`;
-                else if(msg.type === 'text_file') html += `<div>📄 Text: <b>${msg.filename}</b></div><div class="chat-text-preview">${escapeHtml(msg.text)}</div><a href="${msg.url}" class="file-link-btn" download>📥 Download</a>`;
-                else html += `<div>📦 File: <b>${msg.filename}</b></div><a href="${msg.url}" class="file-link-btn" download>📥 Download</a>`;
+                let html = `<div class="msg-sender">${escapeHtml(msg.sender)}</div>`;
+                if(msg.type === 'text') {
+                    html += `<div>${formatMessage(escapeHtml(msg.text))}</div>`;
+                } else if(msg.type === 'image') {
+                    html += `<div>🖼️ Image: <b>${escapeHtml(msg.filename)}</b></div><a href="${msg.url}" target="_blank"><img src="${msg.url}" class="chat-image" loading="lazy"></a>`;
+                } else if(msg.type === 'text_file') {
+                    html += `<div>📄 Text file: <b>${escapeHtml(msg.filename)}</b></div><div class="chat-text-preview">${escapeHtml(msg.text)}</div><a href="${msg.url}" class="file-link-btn" download>📥 Download</a>`;
+                } else {
+                    html += `<div>📦 File: <b>${escapeHtml(msg.filename)}</b></div><a href="${msg.url}" class="file-link-btn" download>📥 Download</a>`;
+                }
                 div.innerHTML = html;
                 area.appendChild(div);
             });
-            area.scrollTop = area.scrollHeight;
+            
+            // Auto-scroll if was at bottom or if new messages arrived
+            if (wasScrolledToBottom || messages.length > lastMessageCount) {
+                area.scrollTop = area.scrollHeight;
+            }
+            lastMessageCount = messages.length;
+        }
+        
+        function formatMessage(text) {
+            // Convert URLs to clickable links
+            const urlRegex = /(https?:\/\/[^\s<]+)/g;
+            return text.replace(urlRegex, '<a href="$1" target="_blank" style="color: inherit; text-decoration: underline;">$1</a>');
         }
 
         function uploadSelectedFile(input) {
-            if(!currentPort || input.files.length === 0) return;
+            if(input.files.length === 0) return;
+            const file = input.files[0];
+            if(file.size > 16 * 1024 * 1024) {
+                alert("File is too large! Maximum size is 16 MB.");
+                input.value = '';
+                return;
+            }
+            
             const formData = new FormData();
-            formData.append('file', input.files[0]); // FIXED: send specific file, not the list
-            formData.append('port', currentPort);
+            formData.append('file', file);
             formData.append('session_id', sessionId);
             input.value = '';
 
             fetch('/upload_file', { method: 'POST', body: formData })
-            .then(res => res.json()).then(data => { if(data.error) alert(data.error); });
+            .then(res => res.json())
+            .then(data => { if(data.error) alert(data.error); });
         }
 
         function sendMessage() {
             const input = document.getElementById('messageInput');
             const text = input.value.trim();
-            if(!text || !currentPort) return;
+            if(!text) return;
+            
             fetch('/send_message', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ port: currentPort, session_id: sessionId, text: text })
-            }).then(res => res.json()).then(data => { if(data.success) input.value = ''; });
+                body: JSON.stringify({ session_id: sessionId, text: text })
+            }).then(res => res.json())
+            .then(data => { 
+                if(data.success) {
+                    input.value = '';
+                    input.focus();
+                }
+            });
         }
 
+        // Poll for new messages
         setInterval(() => {
-            if(currentPort) {
-                fetch(`/get_messages/${currentPort}`).then(res => res.json())
-                .then(data => { renderMessages(data.messages); updateUsersHeaderInfo(data.users); }).catch(e=>{});
-            }
+            fetch('/get_messages').then(res => res.json())
+            .then(data => { 
+                renderMessages(data.messages); 
+                updateOnlineUsers(data.users); 
+            }).catch(e => {});
         }, 1000);
 
-        function handleKeyPress(e) { if(e.key === 'Enter') sendMessage(); }
-        function escapeHtml(text) { return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+        function handleKeyPress(e) { 
+            if(e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage(); 
+            }
+        }
+        
+        function escapeHtml(text) { 
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        // Focus input on load
+        window.addEventListener('load', () => {
+            setTimeout(() => {
+                document.getElementById('messageInput').focus();
+            }, 1500);
+        });
+        
+        // Start the chat
+        joinChat();
     </script>
 </body>
 </html>
