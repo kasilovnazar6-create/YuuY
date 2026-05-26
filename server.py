@@ -16,13 +16,6 @@ if not os.path.exists(UPLOAD_FOLDER):
 
 DB_PATH = 'chat_database.db'
 
-# НЕ УДАЛЯЕМ БАЗУ ДАННЫХ ПРИ ЗАПУСКЕ!
-# if os.path.exists(DB_PATH):
-#     try:
-#         os.remove(DB_PATH)
-#     except:
-#         pass
-
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -127,6 +120,12 @@ def get_allowed_name(requested_name, session_id):
         requested_name = "User"
     base_name = requested_name.strip()
     name = base_name
+    
+    # Check if THIS session already has this name
+    current_name = get_username(session_id)
+    if current_name and current_name.lower() == name.lower():
+        return current_name  # Return existing name if it's the same session
+    
     if is_username_taken(name, session_id):
         counter = 1
         while is_username_taken(f"{base_name}_{counter}", session_id):
@@ -144,7 +143,6 @@ conn.close()
 
 clean_old_messages()
 
-# Приветственное сообщение только если база пустая
 if len(get_all_messages()) == 0:
     add_message("System", "text", "Welcome to YuuY Chat!")
 
@@ -161,6 +159,12 @@ def join_chat():
     data = request.json or {}
     session_id = data.get('session_id')
     requested_name = data.get('username', '').strip()
+    
+    # Try to get saved name for this session
+    saved_name = get_username(session_id)
+    if saved_name and (not requested_name or requested_name == "User"):
+        requested_name = saved_name
+    
     old_name = get_username(session_id)
     final_name = get_allowed_name(requested_name, session_id)
     update_user_online(session_id, final_name)
@@ -744,10 +748,13 @@ HTML_CODE = r"""
     <div class="overlay" id="overlay" onclick="toggleSidebar()"></div>
 
     <script>
+        // Get or create session ID
         if(!localStorage.getItem('chat_sid')) {
             localStorage.setItem('chat_sid', 'u_' + Math.random().toString(36).substr(2, 9));
         }
         const sid = localStorage.getItem('chat_sid');
+        
+        // Get saved nickname
         let myName = localStorage.getItem('chat_name') || 'User';
         document.getElementById('usernameInput').value = myName;
         
@@ -755,6 +762,8 @@ HTML_CODE = r"""
         let unread = 0;
         let focused = true;
         let audio = null;
+        let userScrolled = false;
+        let scrollTimeout = null;
         
         function initAudio() {
             audio = new Audio('/notification.wav');
@@ -817,6 +826,9 @@ HTML_CODE = r"""
                 lastMsgCount = d.messages.length;
                 document.getElementById('messageInput').focus();
                 initAudio();
+                // Scroll to bottom on initial load
+                const area = document.getElementById('messagesArea');
+                area.scrollTop = area.scrollHeight;
             })
             .catch(()=>{
                 document.getElementById('connecting').innerHTML = '<h2>Error</h2><p style="color:var(--text-secondary)">Refresh page</p>';
@@ -834,7 +846,11 @@ HTML_CODE = r"""
                 body:JSON.stringify({session_id:sid, username:name})
             })
             .then(r=>r.ok ? r.json() : r.json().then(d=>{throw new Error(d.error)}))
-            .then(d=>{ myName = d.username; localStorage.setItem('chat_name', myName); })
+            .then(d=>{ 
+                myName = d.username; 
+                localStorage.setItem('chat_name', myName);
+                document.getElementById('usernameInput').value = myName;
+            })
             .catch(e=>{ alert(e.message); document.getElementById('usernameInput').value = myName; });
         }
         
@@ -852,8 +868,21 @@ HTML_CODE = r"""
         
         function renderMessages(msgs, initial=false) {
             const area = document.getElementById('messagesArea');
-            const atBottom = area.scrollHeight - area.scrollTop - area.clientHeight < 60;
+            
+            // Check if user manually scrolled up
+            const atBottom = area.scrollHeight - area.scrollTop - area.clientHeight < 80;
+            
+            // Track user scrolling
+            if (!initial && !atBottom) {
+                userScrolled = true;
+                if (scrollTimeout) clearTimeout(scrollTimeout);
+                scrollTimeout = setTimeout(() => { userScrolled = false; }, 3000);
+            }
+            
             const hasNew = msgs.length > lastMsgCount && lastMsgCount > 0;
+            
+            // Only update DOM if messages changed
+            if (!hasNew && !initial) return;
             
             area.innerHTML = '';
             msgs.forEach((m, i) => {
@@ -877,7 +906,9 @@ HTML_CODE = r"""
             
             if(hasNew) {
                 const newMsgs = msgs.slice(lastMsgCount);
-                if(newMsgs.some(m=>m.sender!=='System' && m.sender!==myName)) {
+                const hasOthers = newMsgs.some(m=>m.sender!=='System' && m.sender!==myName);
+                
+                if (hasOthers) {
                     if(!focused) {
                         unread += newMsgs.filter(m=>m.sender!=='System' && m.sender!==myName).length;
                         document.title = '('+unread+') YuuY Chat';
@@ -887,8 +918,21 @@ HTML_CODE = r"""
             }
             
             lastMsgCount = msgs.length;
-            if(atBottom || hasNew) area.scrollTop = area.scrollHeight;
+            
+            // Only auto-scroll if user hasn't scrolled up manually
+            if (!userScrolled && (atBottom || initial || (hasNew && !userScrolled))) {
+                area.scrollTop = area.scrollHeight;
+            }
         }
+        
+        // Listen for scroll events
+        document.getElementById('messagesArea').addEventListener('scroll', function() {
+            const area = this;
+            const atBottom = area.scrollHeight - area.scrollTop - area.clientHeight < 80;
+            if (atBottom) {
+                userScrolled = false;
+            }
+        });
         
         function linkify(t) {
             return t.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" target="_blank" style="color:inherit;text-decoration:underline">$1</a>');
