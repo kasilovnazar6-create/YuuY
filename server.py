@@ -26,12 +26,17 @@ def init_db():
                   text TEXT,
                   filename TEXT,
                   url TEXT,
-                  timestamp TEXT DEFAULT CURRENT_TIMESTAMP)''')
+                  timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
+                  read_by TEXT DEFAULT '[]')''')
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (session_id TEXT PRIMARY KEY,
                   username TEXT NOT NULL,
                   last_seen TEXT DEFAULT CURRENT_TIMESTAMP,
                   is_online INTEGER DEFAULT 0)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS ip_users
+                 (ip_address TEXT PRIMARY KEY,
+                  session_id TEXT NOT NULL,
+                  last_seen TEXT DEFAULT CURRENT_TIMESTAMP)''')
     c.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp)')
     conn.commit()
     conn.close()
@@ -51,6 +56,7 @@ def clean_old_messages():
                     except:
                         pass
         c.execute('DELETE FROM messages WHERE timestamp < ?', (cutoff_date,))
+        c.execute('DELETE FROM ip_users WHERE last_seen < ?', (cutoff_date,))
         conn.commit()
         conn.close()
     except:
@@ -59,18 +65,41 @@ def clean_old_messages():
 def add_message(sender, msg_type, text="", filename="", url=""):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    timestamp = datetime.now(timezone.utc).isoformat()
     c.execute('INSERT INTO messages (sender, type, text, filename, url, timestamp) VALUES (?,?,?,?,?,?)',
-              (sender, msg_type, text, filename, url, datetime.now(timezone.utc).isoformat()))
+              (sender, msg_type, text, filename, url, timestamp))
     conn.commit()
     conn.close()
 
 def get_all_messages():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('SELECT sender, type, text, filename, url FROM messages ORDER BY id ASC')
-    messages = [{"sender": r[0], "type": r[1], "text": r[2] or "", "filename": r[3] or "", "url": r[4] or ""} for r in c.fetchall()]
+    c.execute('SELECT id, sender, type, text, filename, url, timestamp, read_by FROM messages ORDER BY id ASC')
+    messages = [{
+        "id": r[0],
+        "sender": r[1], 
+        "type": r[2], 
+        "text": r[3] or "", 
+        "filename": r[4] or "", 
+        "url": r[5] or "",
+        "timestamp": r[6] or "",
+        "read_by": json.loads(r[7]) if r[7] else []
+    } for r in c.fetchall()]
     conn.close()
     return messages
+
+def mark_message_read(msg_id, username):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT read_by FROM messages WHERE id=?', (msg_id,))
+    row = c.fetchone()
+    if row:
+        read_by = json.loads(row[0]) if row[0] else []
+        if username not in read_by:
+            read_by.append(username)
+            c.execute('UPDATE messages SET read_by=? WHERE id=?', (json.dumps(read_by), msg_id))
+            conn.commit()
+    conn.close()
 
 def update_user_online(session_id, username):
     conn = sqlite3.connect(DB_PATH)
@@ -121,10 +150,9 @@ def get_allowed_name(requested_name, session_id):
     base_name = requested_name.strip()
     name = base_name
     
-    # Check if THIS session already has this name
     current_name = get_username(session_id)
     if current_name and current_name.lower() == name.lower():
-        return current_name  # Return existing name if it's the same session
+        return current_name
     
     if is_username_taken(name, session_id):
         counter = 1
@@ -133,9 +161,30 @@ def get_allowed_name(requested_name, session_id):
         name = f"{base_name}_{counter}"
     return name
 
+def get_client_ip():
+    """Get the client's IP address, considering proxies"""
+    if request.headers.get('X-Forwarded-For'):
+        return request.headers.get('X-Forwarded-For').split(',')[0].strip()
+    return request.remote_addr
+
+def link_ip_to_session(ip_address, session_id):
+    """Link an IP address to a session, allowing only one session per IP"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT session_id FROM ip_users WHERE ip_address=? AND session_id!=?', (ip_address, session_id))
+    existing = c.fetchone()
+    if existing:
+        conn.close()
+        return existing[0]
+    
+    c.execute('INSERT OR REPLACE INTO ip_users (ip_address, session_id, last_seen) VALUES (?,?,?)',
+              (ip_address, session_id, datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+    return session_id
+
 init_db()
 
-# При запуске сервера устанавливаем всех пользователей оффлайн
 conn = sqlite3.connect(DB_PATH)
 conn.execute('UPDATE users SET is_online=0')
 conn.commit()
@@ -157,10 +206,14 @@ def uploaded_file(filename):
 @app.route('/join_chat', methods=['POST'])
 def join_chat():
     data = request.json or {}
+    client_ip = get_client_ip()
     session_id = data.get('session_id')
     requested_name = data.get('username', '').strip()
     
-    # Try to get saved name for this session
+    # Force one session per IP
+    forced_session = link_ip_to_session(client_ip, session_id)
+    session_id = forced_session
+    
     saved_name = get_username(session_id)
     if saved_name and (not requested_name or requested_name == "User"):
         requested_name = saved_name
@@ -174,7 +227,7 @@ def join_chat():
     elif old_name != final_name:
         add_message("System", "text", f"{old_name} → {final_name}")
     
-    return jsonify({"user": final_name, "messages": get_all_messages(), "active_users": get_all_users()})
+    return jsonify({"user": final_name, "session_id": session_id, "messages": get_all_messages(), "active_users": get_all_users()})
 
 @app.route('/change_nickname', methods=['POST'])
 def change_nickname():
@@ -208,6 +261,29 @@ def send_message():
         add_message(user, "text", text)
         return jsonify({"success": True})
     return jsonify({"success": False}), 400
+
+@app.route('/mark_read', methods=['POST'])
+def mark_read():
+    data = request.json or {}
+    session_id = data.get('session_id')
+    username = get_username(session_id)
+    
+    if not username:
+        return jsonify({"error": "User not found"}), 400
+    
+    # Mark all unread messages as read for this user
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('SELECT id, read_by FROM messages WHERE sender != ?', (username,))
+    for msg_id, read_by_json in c.fetchall():
+        read_by = json.loads(read_by_json) if read_by_json else []
+        if username not in read_by:
+            read_by.append(username)
+            c.execute('UPDATE messages SET read_by=? WHERE id=?', (json.dumps(read_by), msg_id))
+    conn.commit()
+    conn.close()
+    
+    return jsonify({"success": True})
 
 @app.route('/upload_file', methods=['POST'])
 def upload_file():
@@ -368,7 +444,7 @@ HTML_CODE = r"""
             padding: 16px;
             display: flex;
             flex-direction: column;
-            gap: 10px;
+            gap: 4px;
             -webkit-overflow-scrolling: touch;
             background: linear-gradient(180deg, var(--bg-primary) 0%, #0f0c24 100%);
         }
@@ -376,17 +452,31 @@ HTML_CODE = r"""
         .messages-container::-webkit-scrollbar-track { background: transparent; }
         .messages-container::-webkit-scrollbar-thumb { background: var(--border); border-radius: 10px; }
         
+        .date-separator {
+            text-align: center;
+            margin: 12px 0;
+            font-size: 0.75rem;
+            color: var(--text-secondary);
+            background: var(--bg-secondary);
+            padding: 6px 16px;
+            border-radius: 16px;
+            align-self: center;
+            border: 1px solid var(--border);
+        }
+        
         .msg {
             max-width: 80%;
-            padding: 10px 14px;
-            border-radius: 18px;
-            line-height: 1.45;
+            padding: 8px 12px;
+            border-radius: 14px;
+            line-height: 1.4;
             font-size: 0.9rem;
             word-wrap: break-word;
             position: relative;
+            display: flex;
+            flex-direction: column;
         }
-        .msg.new-msg { animation: slideIn 0.35s cubic-bezier(0.16, 1, 0.3, 1); }
-        @keyframes slideIn { from { opacity: 0; transform: translateY(12px) scale(0.95); } to { opacity: 1; transform: translateY(0) scale(1); } }
+        .msg.new-msg { animation: slideIn 0.3s ease-out; }
+        @keyframes slideIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
         
         .msg.system {
             background: var(--bg-secondary);
@@ -405,6 +495,7 @@ HTML_CODE = r"""
             align-self: flex-end;
             border-bottom-right-radius: 6px;
             box-shadow: 0 2px 8px rgba(139, 92, 246, 0.3);
+            margin-left: auto;
         }
         .msg.other {
             background: var(--msg-other);
@@ -412,29 +503,60 @@ HTML_CODE = r"""
             align-self: flex-start;
             border-bottom-left-radius: 6px;
             border: 1px solid var(--border);
+            margin-right: auto;
         }
         .msg-sender {
             font-size: 0.7rem;
             font-weight: 700;
-            margin-bottom: 4px;
+            margin-bottom: 2px;
             opacity: 0.8;
             color: var(--accent-light);
         }
-        .msg.you .msg-sender { color: rgba(255,255,255,0.8); }
+        .msg.you .msg-sender { color: rgba(255,255,255,0.9); }
+        
+        .msg-footer {
+            display: flex;
+            justify-content: flex-end;
+            align-items: center;
+            gap: 4px;
+            margin-top: 4px;
+        }
+        
+        .msg-time {
+            font-size: 0.65rem;
+            opacity: 0.8;
+        }
+        .msg.you .msg-time { color: rgba(255,255,255,0.8); }
+        .msg.other .msg-time { color: var(--text-secondary); }
+        
+        .read-checks {
+            display: inline-flex;
+            gap: 2px;
+            align-items: center;
+        }
+        .read-checks .check {
+            color: rgba(255,255,255,0.5);
+            font-size: 0.7rem;
+        }
+        .read-checks .check.read {
+            color: #6ee7b7;
+        }
+        .msg.other .read-checks { display: none; }
+        
         .chat-image {
             max-width: 100%;
             max-height: 220px;
             border-radius: 10px;
-            margin-top: 8px;
+            margin-top: 4px;
         }
         .chat-text-preview {
             background: var(--bg-primary);
             color: var(--success);
             font-family: 'JetBrains Mono', 'Fira Code', monospace;
-            padding: 10px;
+            padding: 8px;
             border-radius: 8px;
             font-size: 0.8rem;
-            margin-top: 6px;
+            margin-top: 4px;
             max-height: 130px;
             overflow-y: auto;
             white-space: pre-wrap;
@@ -450,7 +572,7 @@ HTML_CODE = r"""
             border-radius: 8px;
             text-decoration: none;
             font-size: 0.8rem;
-            margin-top: 6px;
+            margin-top: 4px;
             font-weight: 600;
             transition: all 0.2s;
             border: 1px solid var(--border);
@@ -609,9 +731,7 @@ HTML_CODE = r"""
             transition: all 0.2s;
         }
         .user-item:hover { background: #2a2050; }
-        .user-item.offline {
-            opacity: 0.45;
-        }
+        .user-item.offline { opacity: 0.45; }
         .status-dot {
             width: 8px;
             height: 8px;
@@ -752,9 +872,8 @@ HTML_CODE = r"""
         if(!localStorage.getItem('chat_sid')) {
             localStorage.setItem('chat_sid', 'u_' + Math.random().toString(36).substr(2, 9));
         }
-        const sid = localStorage.getItem('chat_sid');
+        let sid = localStorage.getItem('chat_sid');
         
-        // Get saved nickname
         let myName = localStorage.getItem('chat_name') || 'User';
         document.getElementById('usernameInput').value = myName;
         
@@ -770,7 +889,13 @@ HTML_CODE = r"""
             audio.volume = 0.3;
         }
         
-        window.addEventListener('focus', () => { focused = true; unread = 0; document.title = 'YuuY Chat'; });
+        window.addEventListener('focus', () => { 
+            focused = true; 
+            unread = 0; 
+            document.title = 'YuuY Chat';
+            // Mark messages as read when window gets focus
+            markAllRead();
+        });
         window.addEventListener('blur', () => { focused = false; });
         
         window.addEventListener('beforeunload', () => {
@@ -796,8 +921,17 @@ HTML_CODE = r"""
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({session_id: sid, username: myName})
                 });
+                markAllRead();
             }
         });
+        
+        function markAllRead() {
+            fetch('/mark_read', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({session_id: sid})
+            });
+        }
         
         function playSound() {
             if(!audio) initAudio();
@@ -809,6 +943,49 @@ HTML_CODE = r"""
             document.getElementById('overlay').classList.toggle('open');
         }
         
+        function formatTime(isoString) {
+            if (!isoString) return '';
+            const date = new Date(isoString);
+            const hours = date.getHours().toString().padStart(2, '0');
+            const minutes = date.getMinutes().toString().padStart(2, '0');
+            return hours + ':' + minutes;
+        }
+        
+        function formatDate(isoString) {
+            if (!isoString) return '';
+            const date = new Date(isoString);
+            const today = new Date();
+            const yesterday = new Date(today);
+            yesterday.setDate(yesterday.getDate() - 1);
+            
+            if (date.toDateString() === today.toDateString()) {
+                return 'Today';
+            } else if (date.toDateString() === yesterday.toDateString()) {
+                return 'Yesterday';
+            } else {
+                const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+                return date.getDate() + ' ' + months[date.getMonth()] + ' ' + date.getFullYear();
+            }
+        }
+        
+        function getReadStatus(msg, onlineUsers) {
+            if (msg.sender !== myName) return '';
+            
+            const totalOthers = onlineUsers.filter(u => u.username !== myName && u.is_online).length;
+            const readCount = msg.read_by ? msg.read_by.filter(u => u !== myName).length : 0;
+            const offlineReadCount = msg.read_by ? msg.read_by.filter(u => u !== myName && !onlineUsers.find(ou => ou.username === u && ou.is_online)).length : 0;
+            
+            if (totalOthers === 0) {
+                return '<span class="read-checks"><span class="check">✓</span></span>';
+            } else if (readCount >= totalOthers) {
+                return '<span class="read-checks"><span class="check read">✓✓</span></span>';
+            } else if (readCount > 0) {
+                return '<span class="read-checks"><span class="check read">✓</span><span class="check">✓</span></span>';
+            } else {
+                return '<span class="read-checks"><span class="check">✓</span></span>';
+            }
+        }
+        
         function joinChat() {
             fetch('/join_chat', {
                 method:'POST',
@@ -818,17 +995,22 @@ HTML_CODE = r"""
             .then(r=>r.json())
             .then(d=>{
                 myName = d.user;
+                if (d.session_id && d.session_id !== sid) {
+                    sid = d.session_id;
+                    localStorage.setItem('chat_sid', sid);
+                }
                 document.getElementById('usernameInput').value = myName;
                 localStorage.setItem('chat_name', myName);
                 document.getElementById('connecting').style.display = 'none';
                 updateUsers(d.active_users);
-                renderMessages(d.messages, true);
+                renderMessages(d.messages, d.active_users, true);
                 lastMsgCount = d.messages.length;
                 document.getElementById('messageInput').focus();
                 initAudio();
-                // Scroll to bottom on initial load
                 const area = document.getElementById('messagesArea');
                 area.scrollTop = area.scrollHeight;
+                // Mark all as read on join
+                markAllRead();
             })
             .catch(()=>{
                 document.getElementById('connecting').innerHTML = '<h2>Error</h2><p style="color:var(--text-secondary)">Refresh page</p>';
@@ -866,13 +1048,11 @@ HTML_CODE = r"""
             ).join('');
         }
         
-        function renderMessages(msgs, initial=false) {
+        function renderMessages(msgs, onlineUsers, initial=false) {
             const area = document.getElementById('messagesArea');
             
-            // Check if user manually scrolled up
             const atBottom = area.scrollHeight - area.scrollTop - area.clientHeight < 80;
             
-            // Track user scrolling
             if (!initial && !atBottom) {
                 userScrolled = true;
                 if (scrollTimeout) clearTimeout(scrollTimeout);
@@ -881,17 +1061,30 @@ HTML_CODE = r"""
             
             const hasNew = msgs.length > lastMsgCount && lastMsgCount > 0;
             
-            // Only update DOM if messages changed
             if (!hasNew && !initial) return;
             
             area.innerHTML = '';
+            let lastDate = '';
+            
             msgs.forEach((m, i) => {
-                const div = document.createElement('div');
                 const isNew = !initial && hasNew && i >= lastMsgCount;
+                const msgDate = formatDate(m.timestamp);
+                
+                // Add date separator if date changed
+                if (msgDate !== lastDate) {
+                    lastDate = msgDate;
+                    const separator = document.createElement('div');
+                    separator.className = 'date-separator';
+                    separator.textContent = msgDate;
+                    area.appendChild(separator);
+                }
+                
+                const div = document.createElement('div');
+                const timeStr = formatTime(m.timestamp);
                 
                 if(m.sender === 'System') {
                     div.className = 'msg system' + (isNew?' new-msg':'');
-                    div.textContent = m.text;
+                    div.innerHTML = m.text + (timeStr ? ' <span style="font-size:0.65rem;opacity:0.7">' + timeStr + '</span>' : '');
                 } else {
                     div.className = (m.sender===myName?'msg you':'msg other') + (isNew?' new-msg':'');
                     let h = `<div class="msg-sender">${esc(m.sender)}</div>`;
@@ -899,6 +1092,12 @@ HTML_CODE = r"""
                     else if(m.type==='image') h += `<div>🖼️ <b>${esc(m.filename)}</b></div><a href="${m.url}" target="_blank"><img src="${m.url}" class="chat-image" loading="lazy"></a>`;
                     else if(m.type==='text_file') h += `<div>📄 <b>${esc(m.filename)}</b></div><div class="chat-text-preview">${esc(m.text)}</div><a href="${m.url}" class="file-link-btn" download>📥 Download</a>`;
                     else h += `<div>📦 <b>${esc(m.filename)}</b></div><a href="${m.url}" class="file-link-btn" download>📥 Download</a>`;
+                    
+                    h += '<div class="msg-footer">';
+                    h += '<span class="msg-time">' + timeStr + '</span>';
+                    h += getReadStatus(m, onlineUsers);
+                    h += '</div>';
+                    
                     div.innerHTML = h;
                 }
                 area.appendChild(div);
@@ -919,13 +1118,16 @@ HTML_CODE = r"""
             
             lastMsgCount = msgs.length;
             
-            // Only auto-scroll if user hasn't scrolled up manually
             if (!userScrolled && (atBottom || initial || (hasNew && !userScrolled))) {
                 area.scrollTop = area.scrollHeight;
             }
+            
+            // Mark messages as read if window is focused
+            if (focused && hasNew) {
+                markAllRead();
+            }
         }
         
-        // Listen for scroll events
         document.getElementById('messagesArea').addEventListener('scroll', function() {
             const area = this;
             const atBottom = area.scrollHeight - area.scrollTop - area.clientHeight < 80;
@@ -962,7 +1164,7 @@ HTML_CODE = r"""
         
         setInterval(()=>{
             fetch('/get_messages').then(r=>r.json()).then(d=>{
-                renderMessages(d.messages);
+                renderMessages(d.messages, d.users);
                 updateUsers(d.users);
             }).catch(()=>{});
         }, 1000);
